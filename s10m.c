@@ -6,26 +6,39 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <pthread.h>
 #include <mosquitto.h>
 #include <modbus.h>
 #include "s10m.h"
 
+#define DEFAULT_MODBUS_HOST "e3dc"
+#define DEFAULT_MODBUS_PORT "502" 
+#define DEFAULT_MQTT_HOST   "localhost"
+#define DEFAULT_MQTT_PORT   1883
+#define DEFAULT_ROOT_TOPIC  "s10"
+#define SUBSCRIBE_TOPIC     "set/#"
+
+modbus_t *ctx = NULL;
 static struct mosquitto *mosq = NULL;
 char root_topic[128];
+char true_value[5];
+char false_value[6];
 int mqtt_qos = 0;
 int mqtt_retain = 0;
 int verbose = 0;
+pthread_t thread;
+pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+char *mqtt_tls_password = NULL;
 
 static void publish(char *topic, char *payload) {
     char tbuf[TOPIC_SIZE];
+    int r;
 
     sprintf(tbuf, "%s/%s", root_topic, topic);
     if (mosq && mosquitto_publish(mosq, NULL, tbuf, strlen(payload), payload, mqtt_qos, mqtt_retain)) {
-        printf("MQTT connection lost\n");
+        r = mosquitto_reconnect(mosq);
+        printf("publish(mosquitto_reconnect): >%s<\n", mosquitto_strerror(r));
         fflush(NULL);
-        mosquitto_disconnect(mosq);
-        mosquitto_destroy(mosq);
-        mosq = NULL;
     }
     if (verbose) printf("MQTT: publish topic >%s< payload >%s<\n", tbuf, payload);
 }
@@ -33,19 +46,42 @@ static void publish(char *topic, char *payload) {
 static void publish_number_if_changed(int16_t *reg, int16_t *old, int format, int r, char *topic) {
     char sbuf[BUFFER_SIZE];
 
-    if (old[r] != reg[r]) {
+    if (old[r] != reg[r] || ((format >= F_UINT32) && (old[r + 1] != reg[r + 1]))) {
         old[r] = reg[r];
         switch (format) {
-            case F1: {
-                sprintf(sbuf, "%d", reg[r]);
+            case F_UINT16: {
+                sprintf(sbuf, "%u", (uint16_t)reg[r]);
                 break;
             }
-            case F01: {
-                sprintf(sbuf, "%.1f", 0.1 * reg[r]);
+            case F_UINT16_01: {
+                sprintf(sbuf, "%.1f", 0.1 * (uint16_t)reg[r]);
                 break;
             }
-            case F001: {
-                sprintf(sbuf, "%.2f", 0.01 * reg[r]);
+            case F_UINT16_001: {
+                sprintf(sbuf, "%.2f", 0.01 * (uint16_t)reg[r]);
+                break;
+            }
+            case F_INT16: {
+                sprintf(sbuf, "%d", (int16_t)reg[r]);
+                break;
+            }
+            case F_INT16_01: {
+                sprintf(sbuf, "%.1f", 0.1 * (int16_t)reg[r]);
+                break;
+            }
+            case F_INT16_001: {
+                sprintf(sbuf, "%.2f", 0.01 * (int16_t)reg[r]);
+                break;
+            }
+            case F_UINT32: {
+                sprintf(sbuf, "%u", (uint16_t)reg[r] + 65535 * (uint16_t)reg[r + 1]);
+                old[r + 1] = reg[r + 1];
+                break;
+            }
+            case F_INT32: {
+                if ((uint16_t)reg[r + 1] >= 32768) sprintf(sbuf, "%d", -1 * ((65535 - (uint16_t)reg[r]) + 65535 * (65535 - (uint16_t)reg[r + 1])));
+                else sprintf(sbuf, "%u", (uint16_t)reg[r] + 65535 * (uint16_t)reg[r + 1]);
+                old[r + 1] = reg[r + 1];
                 break;
             }
         }
@@ -70,12 +106,63 @@ static void publish_string_if_changed(int16_t *reg, char *lst_value, int r, int 
 static void publish_boolean(int16_t *reg, int r, int bit, int b, char *topic) {
     char sbuf[BUFFER_SIZE];
 
-    sprintf(sbuf, "%s", ((reg[r] & b) >> bit)?"true":"false");
+    sprintf(sbuf, "%s", ((reg[r] & b) >> bit)?true_value:false_value);
     publish(topic, sbuf);
 }
 
+static int tls_password_callback(char *buf, int size, int rwflag, void *userdata) {
+    int len = strlen(mqtt_tls_password);
+    if (len >= size) return 0;
+    strcpy(buf, mqtt_tls_password);
+    return len;
+}
+
+static void mqtt_callback_on_connect(struct mosquitto *mosq, void *obj, int result) {
+    char topic[TOPIC_SIZE];
+    snprintf(topic, TOPIC_SIZE, "%s/%s", root_topic, SUBSCRIBE_TOPIC);
+    if (!result) {
+        printf("MQTT: Subscribing >%s<\n", topic);
+        mosquitto_subscribe(mosq, NULL, topic, mqtt_qos);
+    } else {
+        printf("MQTT: Error subscribing topic >%s< failed\n", topic);
+    }
+    return;
+}
+
+static void mqtt_callback_on_message(struct mosquitto *mosq, void *obj, const struct mosquitto_message *msg) {
+    char *p;
+    if (mosq && msg && msg->topic && msg->payloadlen) {
+        if (verbose) printf("MQTT: topic >%s< payload >%s< received\n", msg->topic, (char *)msg->payload);
+        if ((p = strstr(msg->topic, "register/")) && strlen(p + 9)) {
+            int reg = abs(atoi(p + 9));
+            uint16_t value;
+            value = (uint16_t)atoi(msg->payload);
+            if (value >= MODBUS_REG) value = value - MODBUS_REG;
+            pthread_mutex_lock(&lock);
+            if (ctx) {
+                int rc = modbus_write_register(ctx, reg, value);
+                if (rc != 1) {
+                    if (verbose) printf("MODBUS: modbus_write_register failed >%s<\n", modbus_strerror(errno));
+                }
+            } else {
+                printf("MODBUS: modbus_write_register failed. Modbus context not available.\n");
+            }
+            pthread_mutex_unlock(&lock);
+        }
+    }
+    return;
+}
+
+static void *mqtt_listener(void *arg) {
+    struct mosquitto *mosq = arg;
+    int r;
+    if (mosq) {
+         r = mosquitto_loop_forever(mosq, -1, 1);
+         printf("mqtt_listener(mosquitto_loop_forever): Error >%s<\n", mosquitto_strerror(r));
+    }
+}
+
 int main(int argc, char **argv) {
-    modbus_t *ctx = NULL;
     int rc, bg, i, j;
     char tbuf[TOPIC_SIZE];
     char sbuf[BUFFER_SIZE];
@@ -90,18 +177,27 @@ int main(int argc, char **argv) {
     char mqtt_host[128];
     char mqtt_user[128];
     char mqtt_password[128];
+    int tls = 0;
+    char *tls_cafile = NULL;
+    char *tls_capath = NULL;
+    char *tls_certfile = NULL;
+    char *tls_keyfile = NULL;
     char modbus_host[128];
     char modbus_port[128];
-    int mqtt_port = 1883;
+    int mqtt_port = DEFAULT_MQTT_PORT;
     int mqtt_auth = 0;
     int interval = 1;
     int force = 0;
     int pool_length = sizeof(pool) / sizeof(pool[0]);
+    char *env = NULL;
 
-    int16_t *regs = malloc((MODBUS_1_NR + MODBUS_2_NR) * sizeof(int16_t));
-    int16_t *olds = malloc((MODBUS_1_NR + MODBUS_2_NR) * sizeof(int16_t));
+    uint16_t *regs = malloc((MODBUS_1_NR + MODBUS_2_NR) * sizeof(uint16_t));
+    uint16_t *olds = malloc((MODBUS_1_NR + MODBUS_2_NR) * sizeof(uint16_t));
 
-    for (j = 0; j < (MODBUS_1_NR + MODBUS_2_NR); j++) olds[j] = 2 ^ 15 - 1;
+    for (j = 0; j < (MODBUS_1_NR + MODBUS_2_NR); j++) {
+        regs[j] = 0;
+        olds[j] = 32768;
+    }
 
     reg_nr[0] = MODBUS_1_NR;
     reg_delta[0] = 1;
@@ -110,10 +206,10 @@ int main(int argc, char **argv) {
     reg_delta[1] = MODBUS_1_NR;
     reg_offset[1] = MODBUS_2_OFFSET;
 
-    strcpy(modbus_host, "e3dc");
-    strcpy(modbus_port, "502");
-    strcpy(mqtt_host, "localhost");
-    strcpy(root_topic, "s10");
+    strcpy(modbus_host, DEFAULT_MODBUS_HOST);
+    strcpy(modbus_port, DEFAULT_MODBUS_PORT);
+    strcpy(mqtt_host, DEFAULT_MQTT_HOST);
+    strcpy(root_topic, DEFAULT_ROOT_TOPIC);
     strcpy(mqtt_user, "");
     strcpy(mqtt_password, "");
     strcpy(manufacturer, "");
@@ -122,6 +218,8 @@ int main(int argc, char **argv) {
     strcpy(firmware, "");
     strcpy(bstate, "");
     strcpy(gstate, "");
+    strcpy(true_value, "true");
+    strcpy(false_value, "false");
 
     j = bg = 0;
     while (j < argc) {
@@ -132,9 +230,7 @@ int main(int argc, char **argv) {
     FILE *fp;
 
     fp = fopen(CONFIG_FILE, "r");
-    if (!fp)
-        printf("Config file %s not found. Using default values.\n", CONFIG_FILE);
-    else {
+    if (fp) {
         while (fgets(line, sizeof(line), fp)) {
             memset(key, 0, sizeof(key));
             memset(value, 0, sizeof(value));
@@ -160,13 +256,75 @@ int main(int argc, char **argv) {
                 if (mqtt_qos > 2) mqtt_qos = 0;
                 else if (!strcasecmp(key, "INTERVAL"))
                     interval = abs(atoi(value));
+                else if (!strcasecmp(key, "MQTT_TLS") && !strcasecmp(value, "true"))
+                    tls = 1;
+                else if (!strcasecmp(key, "MQTT_CAFILE"))
+                    strcpy(tls_cafile, value);
+                else if (!strcasecmp(key, "MQTT_CAPATH"))
+                    strcpy(tls_capath, value);
+                else if (!strcasecmp(key, "MQTT_CERTFILE"))
+                    strcpy(tls_certfile, value);
+                else if (!strcasecmp(key, "MQTT_KEYFILE"))
+                    strcpy(tls_keyfile, value);
+                else if (!strcasecmp(key, "MQTT_TLS_PASSWORD"))
+                    strcpy(mqtt_tls_password, value);
                 else if (!strcasecmp(key, "ROOT_TOPIC"))
                     strncpy(root_topic, value, 24);
                 else if (!strcasecmp(key, "FORCE") && !strcasecmp(value, "true"))
                     force = 1;
+                else if (!strcasecmp(key, "VERBOSE") && !strcasecmp(value, "true"))
+                    verbose = 1;
+                else if ((strcasecmp(key, "USE_TRUE_FALSE") == 0) && (strcasecmp(value, "false") == 0)) {
+                    strcpy(true_value, "1");
+                    strcpy(false_value, "0");
+                }
             }
         }
         fclose(fp);
+    }
+
+    env = getenv("MODBUS_HOST");
+    if (env) strcpy(modbus_host, env);
+    env = getenv("MODBUS_PORT");
+    if (env) strcpy(modbus_port, env);
+    env = getenv("MQTT_HOST");
+    if (env) strcpy(mqtt_host, env);
+    env = getenv("MQTT_PORT");
+    if (env) mqtt_port = atoi(env);
+    env = getenv("MQTT_USER");
+    if (env) strcpy(mqtt_user, env);
+    env = getenv("MQTT_PASSWORD");
+    if (env) strcpy(mqtt_password, env);
+    env = getenv("MQTT_AUTH");
+    if (env && !strcasecmp(env, "true")) mqtt_auth = 1;
+    env = getenv("MQTT_RETAIN");
+    if (env && !strcasecmp(env, "true")) mqtt_retain = 1;
+    env = getenv("MQTT_QOS");
+    if (env) mqtt_qos = atoi(env);
+    env = getenv("INTERVAL");
+    if (env) interval = atoi(env);
+    env = getenv("MQTT_TLS");
+    if (env && !strcasecmp(env, "true")) tls = 1;
+    env = getenv("MQTT_CAFILE");
+    if (env) strcpy(tls_cafile, env);
+    env = getenv("MQTT_CAPATH");
+    if (env) strcpy(tls_capath, env);
+    env = getenv("MQTT_CERTFILE");
+    if (env) strcpy(tls_certfile, env);
+    env = getenv("MQTT_KEYFILE");
+    if (env) strcpy(tls_keyfile, env);
+    env = getenv("MQTT_TLS_PASSWORD");
+    if (env) strcpy(mqtt_tls_password, env);
+    env = getenv("ROOT_TOPIC");
+    if (env) strncpy(root_topic, env, 24);
+    env = getenv("FORCE");
+    if (env && !strcasecmp(env, "true")) force = 1;
+    env = getenv("VERBOSE");
+    if (env && !strcasecmp(env, "true")) verbose = 1;
+    env = getenv("USE_TRUE_FALSE");
+    if (env && !strcasecmp(env, "false")) {
+        strcpy(true_value, "1");
+        strcpy(false_value, "0");
     }
 
     printf("Connecting...\n");
@@ -177,7 +335,6 @@ int main(int argc, char **argv) {
     printf("Force mode = %s\n", force?"true":"false");
     if (isatty(STDOUT_FILENO)) {
         printf("Stdout to terminal\n");
-        verbose = 1;
     } else {
         printf("Stdout to pipe/file\n");
         bg = 0;
@@ -206,6 +363,11 @@ int main(int argc, char **argv) {
 
     mosquitto_lib_init();
 
+    if (pthread_mutex_init(&lock, NULL)) {
+        printf("pthread_mutex_init has failed.\n");
+        exit(EXIT_FAILURE);
+    }
+
     while (1) {
         // MQTT connection
         if (!mosq) {
@@ -213,10 +375,22 @@ int main(int argc, char **argv) {
             printf("Connecting to MQTT broker %s:%i\n", mqtt_host, mqtt_port);
             fflush(NULL);
             if (mosq) {
+                mosquitto_connect_callback_set(mosq, mqtt_callback_on_connect);
+                mosquitto_message_callback_set(mosq, mqtt_callback_on_message);
+                if (tls && mqtt_tls_password) {
+                    if (mosquitto_tls_set(mosq, tls_cafile, tls_capath, tls_certfile, tls_keyfile, tls_password_callback) != MOSQ_ERR_SUCCESS) {       
+                        printf("Error: Unable to set TLS options.\n");
+                    }
+                } else if (tls) {
+                    if (mosquitto_tls_set(mosq, tls_cafile, tls_capath, tls_certfile, tls_keyfile, NULL) != MOSQ_ERR_SUCCESS) {
+                        printf("Error: Unable to set TLS options.\n");
+                    }
+                }
                 if (mqtt_auth && strcmp(mqtt_user, "") && strcmp(mqtt_password, "")) mosquitto_username_pw_set(mosq, mqtt_user, mqtt_password);
                 if (!mosquitto_connect(mosq, mqtt_host, mqtt_port, 10)) {
                     printf("MQTT: Connected successfully\n");
                     fflush(NULL);
+                    pthread_create(&thread, NULL, &mqtt_listener, mosq);
                 } else {
                     printf("MQTT: Connection failed\n");
                     fflush(NULL);
@@ -233,13 +407,13 @@ int main(int argc, char **argv) {
             ctx = modbus_new_tcp_pi(modbus_host, modbus_port);
 
             if (!ctx) {
-                printf("E3DC_MODBUS: Unable to allocate libmodbus context\n");
+                printf("MODBUS: Unable to allocate libmodbus context\n");
                 fflush(NULL);
                 sleep(1);
                 continue;
             }
             if (modbus_connect(ctx) == -1) {
-                printf("E3DC_MODBUS: Connection failed: %s\n", modbus_strerror(errno));
+                printf("MODBUS: Connection failed: %s\n", modbus_strerror(errno));
                 fflush(NULL);
                 if (ctx) modbus_free(ctx);
                 ctx = NULL;
@@ -250,16 +424,17 @@ int main(int argc, char **argv) {
             modbus_set_response_timeout(ctx, 1, 0); // 1 second timeout
             modbus_set_error_recovery(ctx, MODBUS_ERROR_RECOVERY_LINK | MODBUS_ERROR_RECOVERY_PROTOCOL);
 
-            printf("E3DC_MODBUS: Connected successfully\n");
+            printf("MODBUS: Connected successfully\n");
             fflush(NULL);
         }
 
-        if (force) for (j = 0; j < (MODBUS_1_NR + MODBUS_2_NR); j++) olds[j] = 2 ^ 15 - 1;
+        if (force) for (j = 0; j < (MODBUS_1_NR + MODBUS_2_NR); j++) olds[j] = 32768;
 
+        pthread_mutex_lock(&lock);
         for (i = 0; i < 2; i++) {
             rc = modbus_read_registers(ctx, reg_offset[i], reg_nr[i], &regs[reg_delta[i]]);
             if (rc != reg_nr[i]) {
-                printf("E3DC_MODBUS: ERROR modbus_read_registers at %d (%d/%d)\n", reg_delta[i], rc, reg_nr[i]);
+                printf("MODBUS: ERROR modbus_read_registers at %d (%d/%d) >%s<\n", reg_delta[i], rc, reg_nr[i], modbus_strerror(errno));
                 fflush(NULL);
                 if (ctx) modbus_close(ctx);
                 if (ctx) modbus_free(ctx);
@@ -268,9 +443,10 @@ int main(int argc, char **argv) {
                 continue;
             }
         }
+        pthread_mutex_unlock(&lock);
 
-        if (regs[1] != -7204) {
-            printf("E3DC_MODBUS: Modbus mode is wrong (%x). Must be E3DC, not SUN_SPEC.\n", regs[1]);
+        if (regs[1] != 58332) {
+            printf("MODBUS: Modbus mode is wrong (%x). Must be E3DC, not SUN_SPEC.\n", regs[1]);
             fflush(NULL);
             sleep(interval);
             continue;
@@ -296,8 +472,8 @@ int main(int argc, char **argv) {
         }
 
         if (regs[88] & 1) {
-            publish_number_if_changed(regs, olds, F1, 78, "wallbox/total/power");
-            publish_number_if_changed(regs, olds, F1, 80, "wallbox/solar/power");
+            publish_number_if_changed(regs, olds, F_UINT32, 78, "wallbox/total/power");
+            publish_number_if_changed(regs, olds, F_UINT32, 80, "wallbox/solar/power");
         }
 
         for (wallbox = 0; wallbox < 8; wallbox++) {
@@ -317,7 +493,7 @@ int main(int argc, char **argv) {
         }
 
         if (olds[70] != regs[70]) {
-            if (regs[71] >= 0) {
+            if (regs[71] < 32768) {
                 if ((regs[70] == 0) && (regs[83] == 0)) {
                     if (strcmp(bstate, "EMPTY")) {
                         publish("battery/state", "EMPTY");
@@ -364,8 +540,8 @@ int main(int argc, char **argv) {
         publish_string_if_changed(regs, &serial_number[0], 36, 16, "serial_number");
         publish_string_if_changed(regs, &firmware[0], 52, 16, "firmware");
 
-        if (olds[74] != regs[74]) {
-            if (regs[75] < 0) {
+        if ((olds[74] != regs[74]) || (olds[75] != regs[75])) {
+            if (regs[75] >= 32768) {
                 if (strcmp(gstate, "IN")) {
                     publish("grid/state", "IN");
                     if (!force) strcpy(gstate, "IN");
@@ -390,6 +566,7 @@ int main(int argc, char **argv) {
     if (olds) free(olds);
 
     mosquitto_lib_cleanup();
+    pthread_mutex_destroy(&lock);
 
     exit(EXIT_SUCCESS);
 }

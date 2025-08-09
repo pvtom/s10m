@@ -1,12 +1,39 @@
+#-E3DC Modbus
 MODBUS_HOST=e3dc
 MODBUS_PORT=502
-MQTT_HOST=mqttbroker
+
+#-MQTT Broker
+#--Name or IP address and port of your MQTT broker
+MQTT_HOST=
 MQTT_PORT=1883
+#--MQTT parameters
+MQTT_QOS=0
+MQTT_RETAIN=false
+#--MQTT authentication if necessary set MQTT_AUTH=true and enter user and password
 MQTT_AUTH=false
 MQTT_USER=
 MQTT_PASSWORD=
-MQTT_RETAIN=false
-MQTT_QOS=0
+#--MQTT TLS configuration
+MQTT_TLS=false
+MQTT_TLS_CAFILE=
+MQTT_TLS_CAPATH=
+MQTT_TLS_CERTFILE=
+MQTT_TLS_KEYFILE=
+MQTT_TLS_PASSWORD=
+
+#-System
+#--cycle interval in seconds
 INTERVAL=1
-ROOT_TOPIC=s10
+#-Forced Topics
+#--will be published with every cycle
 FORCE=false
+#-Verbose mode
+VERBOSE=false
+
+#-MQTT Topics
+#--Topic prefix (max 24 characters), default is s10
+ROOT_TOPIC=s10
+
+#-MQTT Payload
+#--Boolean values true/false or 1/0
+USE_TRUE_FALSE=true

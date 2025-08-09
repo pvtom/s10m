@@ -2,12 +2,13 @@
 
 A Docker image is available at https://hub.docker.com/r/pvtom/s10m
 
-### Configuration
-
-Create a `.config` file as described in the [Readme](README.md).
-
 ### Start the docker container
 
+```
+docker run --rm -e MODBUS_HOST=your_e3dc_device -e MQTT_HOST=your_mqtt_broker pvtom/s10m:latest
+```
+
+Or create a `.config` file as described in the [Readme](README.md) and start with
 ```
 docker run --rm -v /path/to/your/.config:/app/.config pvtom/s10m:latest
 ```
